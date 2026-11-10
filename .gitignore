@@ -1,0 +1,30 @@
+# API Keys
+.env
+**/.env
+example.env
+ToolsAgent/example.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Temporary data
+data/text_kg_work/
+data/raw_documents/
+ToolsAgent/TempFiles/
+
+# Old or test graphs
+KG/storage_graph_large/
+KG/storage_graph_bge_m3_kgqa_test/
+
+# Operating system
+.DS_Store
+Thumbs.db

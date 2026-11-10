@@ -1,0 +1,8 @@
+# Additional dependencies for the unified Streamlit UI and document ingestion.
+# Use inside the pre-existing, working SciToolAgent Conda environment.
+streamlit>=1.33
+pandas>=2.0
+openpyxl>=3.1
+httpx>=0.25
+python-dotenv>=1.0
+tiktoken>=0.6
