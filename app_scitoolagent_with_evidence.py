@@ -18,12 +18,14 @@ import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 from text_ingestion.excel_exporter import export_excel
+from kg_fusion.merge_planner import make_fusion_plan
 from text_ingestion.normalize import TOOL_COLUMNS, TRIPLE_COLUMNS
 from unified_services import (
     MAIN_KG, TEST_KG, create_text_run, extract_to_excel, find_graph_evidence,
     ask_graph_deepseek, kg_dir, invoke_incremental, read_graph, entity_edges,
 )
 from scripts.tool_registry import registered_tool_names
+from kg_management.manager import incident_edges, plan_deletion, commit_deletion
 
 ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/'example.env', override=False)
@@ -175,46 +177,100 @@ with upload_tab:
                            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         st.caption('系统内部会使用该Excel调用已有incremental_from_excel.py；不需要手动编辑Excel。')
         if not tables['Tools'] and not tables['Triples']:
-            st.warning('本次没有可入库记录。普通叙述性文档目前无法自动形成通用事实图谱；抽取器仍以科学工具及其关系为主。')
+            st.warning('本次没有可入库记录。')
         else:
-            if st.button('③ 对当前图谱进行增量预检',type='secondary'):
-                try:
-                    target=graph_state(selected_kg)
-                    with st.spinner('预检中：不会写入任何图谱文件...'):
-                        result=invoke_incremental(run/'review.xlsx',target,commit=False)
-                    st.session_state['last_preflight']=True
-                    st.session_state['last_preflight_run']=str(run)
-                    st.session_state['last_preflight_kg']=str(target)
-                    st.code(result,language='text')
-                except Exception as exc:
-                    st.session_state['last_preflight']=False
-                    st.error(str(exc))
             st.divider()
-            st.subheader('3. 确认入库')
-            if selected_kg=='正式图谱':
-                st.warning('目前选择的是正式图谱。写入前会自动备份，但推荐先在测试图谱验证。')
-            else:
-                st.info('目前选择的是测试图谱；首次写入时会自动复制正式图谱，正式索引不会改变。')
-            review_ok=st.checkbox('我已检查Tools和Review；同意只导入通过校验的记录',key='review_confirmation')
-            prod_ok=True
-            if selected_kg=='正式图谱':
-                prod_ok=st.checkbox('我确认要修改正式知识图谱，并已检查工具的安全属性',key='prod_confirmation')
-            if st.button('④ 写入选定知识图谱并更新BGE-M3索引',type='primary',
-                         disabled=not (review_ok and prod_ok and st.session_state.get('last_preflight')
-                                       and st.session_state.get('last_preflight_run')==str(run)
-                                       and st.session_state.get('last_preflight_kg')==str(TEST_KG if selected_kg=='测试图谱' else MAIN_KG))):
-                try:
-                    target=graph_state(selected_kg)
-                    with st.spinner('正在执行增量写入与BGE-M3更新，请勿关闭页面...'):
-                        report=invoke_incremental(run/'review.xlsx',target,commit=True,device=device)
-                    st.session_state['last_ingest_log']=report
-                    st.session_state['last_preflight']=False
-                    st.success('增量流程已结束。下方问答将重新读取当前图谱。')
-                    st.code(report,language='text')
-                except Exception as exc:
-                    st.error(f'入库失败：{exc}')
+            st.subheader('3. 与当前知识图谱融合')
+            st.caption('同名工具不直接覆盖：功能、输入、输出、类别、安全属性的差异只进入审核；'
+                       '已有工具的新来源经人工勾选后才补充；有证据的其他合法新关系可增量写入。')
+            try:
+                target=graph_state(selected_kg)
+                draft=make_fusion_plan(run/'review.xlsx',target)
+            except Exception as exc:
+                draft=None
+                st.error(f'融合方案生成失败：{type(exc).__name__}: {exc}')
+
+            approved_source_ids=[]
+            if draft:
+                stats=draft['stats']
+                m1,m2,m3,m4=st.columns(4)
+                m1.metric('新工具',stats['new_tools'])
+                m2.metric('已有工具',stats['existing_tools'])
+                m3.metric('重复记录',stats['duplicates'])
+                m4.metric('字段冲突/需复核',stats['needs_review'])
+                st.caption(f"可新增关系：{stats['new_extra_triples']}；需人工确认的来源补充：{stats['source_candidates']}")
+                if draft['reviews']:
+                    with st.expander(f"待审核的旧实体差异（{len(draft['reviews'])}条；不会自动覆盖）",expanded=True):
+                        st.dataframe(pd.DataFrame(draft['reviews']),hide_index=True,use_container_width=True)
+                if draft['source_options']:
+                    src_map={f"{x['Name']}：{x['Existing'] or '（原图谱无来源）'} → {x['Source']}":x['id']
+                             for x in draft['source_options']}
+                    approved_labels=st.multiselect('可选：批准已有工具的新增来源关系（默认全部不批准）',
+                        options=list(src_map),key='fusion_sources_'+run.name,
+                        help='只允许额外增加 is sourced from；不会替换旧来源。')
+                    approved_source_ids=[src_map[k] for k in approved_labels]
+                if st.button('③ 生成融合方案并进行增量预检',type='secondary'):
+                    try:
+                        plan=make_fusion_plan(run/'review.xlsx',target,approved_source_ids)
+                        prepared=run/'fusion_ready.xlsx'
+                        export_excel(plan['tables'],prepared,overwrite=True)
+                        report_data={k:v for k,v in plan.items() if k!='tables'}
+                        (run/'fusion_report.json').write_text(
+                            json.dumps(report_data,ensure_ascii=False,indent=2),encoding='utf-8')
+                        with st.spinner('只执行预检，不修改图谱'):
+                            result=invoke_incremental(prepared,target,commit=False)
+                        st.session_state['last_preflight']=True
+                        st.session_state['last_preflight_run']=str(run)
+                        st.session_state['last_preflight_kg']=str(target)
+                        st.session_state['last_preflight_approvals']=sorted(approved_source_ids)
+                        st.session_state['last_preflight_filehash']=sha256(prepared.read_bytes()).hexdigest()
+                        st.code(result,language='text')
+                        st.success('融合预检完成。原图谱尚未修改。')
+                    except Exception as exc:
+                        st.session_state['last_preflight']=False
+                        st.error(str(exc))
+                st.divider()
+                st.subheader('4. 确认写入（只写入融合方案中已接受的内容）')
+                if selected_kg=='正式图谱':
+                    st.warning('当前选择正式图谱；入库会自动备份。建议先在测试图谱验证。')
+                else:
+                    st.info('当前使用测试图谱，不会修改正式图谱。')
+                review_ok=st.checkbox('我已阅读融合方案和冲突项；同意只写入已接受的记录',
+                                      key='review_confirmation')
+                prod_ok=True
+                if selected_kg=='正式图谱':
+                    prod_ok=st.checkbox('我确认修改正式知识图谱并核对安全字段',key='prod_confirmation')
+                prepared=run/'fusion_ready.xlsx'
+                approved_unchanged=(st.session_state.get('last_preflight_approvals')==sorted(approved_source_ids))
+                file_unchanged=(prepared.is_file() and
+                                st.session_state.get('last_preflight_filehash')==sha256(prepared.read_bytes()).hexdigest())
+                ready=bool(review_ok and prod_ok and st.session_state.get('last_preflight') and
+                    st.session_state.get('last_preflight_run')==str(run) and
+                    st.session_state.get('last_preflight_kg')==str(target) and
+                    approved_unchanged and file_unchanged)
+                if st.button('④ 确认融合并更新BGE-M3图谱',type='primary',disabled=not ready):
+                    try:
+                        # Recompute: a pending manually edited worksheet or changed KG must not silently write.
+                        fresh=make_fusion_plan(run/'review.xlsx',target,approved_source_ids)
+                        candidate=run/'fusion_verify.xlsx'
+                        export_excel(fresh['tables'],candidate,overwrite=True)
+                        import pandas as _pd
+                        # Compare canonical content; xlsx byte-level equality may include zip metadata.
+                        for name in ('Tools','Triples'):
+                            a=_pd.read_excel(prepared,sheet_name=name,keep_default_na=False,dtype=str)
+                            b=_pd.read_excel(candidate,sheet_name=name,keep_default_na=False,dtype=str)
+                            if not a.equals(b):
+                                raise RuntimeError('知识图谱或融合方案已变化，请重新进行预检')
+                        with st.spinner('正在更新图谱，请勿同时提交其他入库任务'):
+                            result=invoke_incremental(prepared,target,commit=True,device=device)
+                        st.session_state['last_ingest_log']=result
+                        st.session_state['last_preflight']=False
+                        st.success('融合入库流程结束。下一次问答将使用当前图谱。')
+                        st.code(result,language='text')
+                    except Exception as exc:
+                        st.error('融合入库失败：'+str(exc))
             if st.session_state.get('last_ingest_log'):
-                with st.expander('最近一次入库日志'):
+                with st.expander('最近一次融合入库日志'):
                     st.code(st.session_state['last_ingest_log'],language='text')
 
 with qa_tab:
@@ -290,24 +346,76 @@ with qa_tab:
                 st.caption('本模式使用本地图谱的字面实体/关键词匹配和至多三跳扩展；不是完整语义RAG，也不执行工具。')
 
 with browse_tab:
-    st.subheader('浏览本地图谱')
-    st.caption('浏览直接从所选索引的graph_store.json读取，不依赖Neo4j，不修改存储。')
-    with st.form('entity_browser'):
-        entity_name=st.text_input('实体名称（例如 NameToSMILES、SMILES）',value='NameToSMILES')
-        browse_submit=st.form_submit_button('查看实体及其相邻关系')
-    if browse_submit:
-        try:
-            g=read_graph(graph_state(selected_kg))
-            name=entity_name.strip()
-            ev=entity_edges(g,name,max_edges=60)
-            if not ev:
-                st.warning(f'图谱中未找到实体「{name}」的直接输出边。')
-            else:
-                st.success(f'找到{len(ev)}条直接输出关系')
-                st.graphviz_chart(dot_graph(ev,[name]),use_container_width=True)
-                st.dataframe(pd.DataFrame(ev,columns=['Subject','Predicate','Object']),use_container_width=True,hide_index=True)
-        except Exception as exc:
-            st.error(f'图谱浏览失败：{exc}')
+    st.subheader('本地图谱浏览与管理')
+    st.caption('管理当前侧边栏选择的本地图谱；实体删除会移除其全部入边和出边，并清除相关功能向量。')
+    try:
+        folder=graph_state(selected_kg)
+        graph=read_graph(folder)
+        entity_name=st.text_input('搜索实体（精确名称）',value='NameToSMILES',key='graph_manage_entity')
+        entity_name=entity_name.strip()
+        edges=incident_edges(graph,entity_name) if entity_name else []
+        if edges:
+            st.success(f'找到 {len(edges)} 条关联关系（含指向该实体的关系）')
+            st.graphviz_chart(dot_graph(edges[:80],[entity_name]),use_container_width=True)
+            st.dataframe(pd.DataFrame(edges,columns=['Subject','Predicate','Object']),
+                         use_container_width=True,hide_index=True)
+        elif entity_name:
+            st.info('当前图谱中没有找到该实体关联的关系。')
+
+        st.divider()
+        st.markdown('#### 删除关系或实体')
+        st.warning('删除会影响知识图谱问答和工具检索；不会卸载ToolsAgent中的Python函数，也不会自动同步Neo4j。')
+        last=st.session_state.get('graph_manage_last_result')
+        if last:
+            st.success(f"最近一次删除成功：{last['removed_triples']}条关系，{last['removed_embeddings']}条向量。")
+            st.caption('自动备份：'+last['backup'])
+
+        mode=st.radio('删除模式',['仅删除选定关系','删除整个实体及所有关联关系'],horizontal=True,
+                      key='graph_manage_mode')
+        choice=None
+        if mode=='仅删除选定关系' and edges:
+            choice=st.selectbox('选择要删除的三元组',options=edges,
+                format_func=lambda t:f'{t[0]}  →  {t[1]}  →  {t[2]}',key='graph_manage_edge')
+            include_inverse=st.checkbox('如存在配对的输入/输出反向关系，一并删除（推荐）',
+                                         value=True,key='graph_manage_inverse')
+        else:
+            include_inverse=False
+        if entity_name and edges:
+            try:
+                plan=plan_deletion(folder,entity=entity_name if mode.startswith('删除整个') else None,
+                    triple=choice if mode.startswith('仅删除') else None,include_inverse=include_inverse)
+                impacted=plan['triples_to_remove']
+                st.markdown('**删除影响预览（尚未修改文件）**')
+                x1,x2,x3=st.columns(3)
+                x1.metric('将删关系',len(impacted))
+                x2.metric('将删BGE-M3向量',len(plan['embeddings_to_remove']))
+                x3.metric('删除后剩余关系',plan['triple_count_after'])
+                st.dataframe(pd.DataFrame(impacted,columns=['Subject','Predicate','Object']),
+                             use_container_width=True,hide_index=True)
+                if plan['embeddings_to_remove']:
+                    st.info('这些关系包含已索引的工具功能描述，相关BGE-M3向量会同步删除。')
+                if selected_kg=='正式图谱':
+                    st.error('当前是正式图谱！强烈建议先切到测试图谱操作。')
+                # A version/target-specific confirmation prevents accidental repeat deletion.
+                confirmation_key=sha256(json.dumps([selected_kg,mode,plan['target'],plan['version']],
+                    ensure_ascii=False,sort_keys=True).encode('utf-8')).hexdigest()[:16]
+                approved=st.checkbox('我已核对以上所有待删关系，并确认同意备份后删除',
+                                     key='graph_manage_approved_'+confirmation_key)
+                phrase=st.text_input(f'输入实体名称「{entity_name}」以确认操作',
+                                     value='',key='graph_manage_confirm_'+confirmation_key)
+                prod_ok=True
+                if selected_kg=='正式图谱':
+                    prod_ok=st.checkbox('我确认这是正式图谱，而不是测试图谱',key='graph_manage_prod_'+confirmation_key)
+                if st.button('确认删除并自动备份',type='primary',
+                              disabled=not (approved and phrase==entity_name and prod_ok),
+                              key='graph_manage_commit'):
+                    result=commit_deletion(folder,plan)
+                    st.session_state['graph_manage_last_result']=result
+                    st.rerun()
+            except Exception as exc:
+                st.error('删除预览/执行失败：'+str(exc))
+    except Exception as exc:
+        st.error('图谱浏览与管理失败：'+str(exc))
 
 st.divider()
 st.caption('已保留原始Agent执行链；新增文本入库和图谱证据问答均使用选择的本地图谱。Neo4j不会自动同步。')

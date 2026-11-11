@@ -137,9 +137,18 @@ def invoke_incremental(excel: Path, folder: Path, *, commit=False, device='cpu')
         except FileExistsError:
             raise RuntimeError('已有其他进程正在写入此图谱')
     try:
-        proc = subprocess.run(args,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
-                              text=True,encoding='utf-8',errors='replace',timeout=3600 if commit else 150,
-                              shell=False)
+        proc = subprocess.run(
+            args,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            timeout=3600 if commit else 150,
+            shell=False
+        )
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
